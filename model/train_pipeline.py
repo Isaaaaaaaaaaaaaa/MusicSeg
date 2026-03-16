@@ -15,7 +15,7 @@ def main():
     parser.add_argument("--boundary_epochs", type=int, default=0, help="边界模型训练轮数（0则使用epochs）")
     parser.add_argument("--classifier_epochs", type=int, default=0, help="分类器训练轮数（0则使用epochs）")
     parser.add_argument(
-        "--arch", choices=["lstm", "transformer", "ms_transformer", "ms_transformer_v2", "songformer_ds", "multi_res", "songformer"], default="transformer", help="模型架构"
+        "--arch", choices=["lstm", "transformer", "ms_transformer", "ms_transformer_v2", "songformer_ds", "v4", "multi_res", "songformer"], default="transformer", help="模型架构"
     )
     parser.add_argument("--val_ratio", type=float, default=0.1, help="验证集比例")
     parser.add_argument("--test_ratio", type=float, default=0.1, help="测试集比例")

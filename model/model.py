@@ -793,6 +793,211 @@ class TimeDownsample1D(nn.Module):
 
 
 
+class RoPEMultiHeadAttention(nn.Module):
+    """Rotary Position Embedding based Multi-Head Attention (SOTA: SongFormer style)."""
+    def __init__(self, d_model: int, nhead: int, dropout: float = 0.0, rope_base: float = 10000.0):
+        super().__init__()
+        assert d_model % nhead == 0, "d_model must be divisible by nhead"
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        assert self.head_dim % 2 == 0, "head_dim must be even for RoPE"
+        self.rope_base = rope_base
+        self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
+        self.out = nn.Linear(d_model, d_model, bias=False)
+        self.drop = nn.Dropout(dropout)
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        return torch.stack([-x2, x1], dim=-1).flatten(-2)
+
+    def _rope_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype):
+        half = self.head_dim // 2
+        inv_freq = 1.0 / (self.rope_base ** (torch.arange(0, half, device=device, dtype=torch.float32) / float(half)))
+        t = torch.arange(seq_len, device=device, dtype=torch.float32)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        return emb.cos()[None, None, :, :].to(dtype), emb.sin()[None, None, :, :].to(dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, c = x.shape
+        qkv = self.qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.view(b, t, self.nhead, self.head_dim).transpose(1, 2)
+        k = k.view(b, t, self.nhead, self.head_dim).transpose(1, 2)
+        v = v.view(b, t, self.nhead, self.head_dim).transpose(1, 2)
+        cos, sin = self._rope_cache(t, x.device, q.dtype)
+        q = (q * cos) + (self._rotate_half(q) * sin)
+        k = (k * cos) + (self._rotate_half(k) * sin)
+        dp = float(self.drop.p) if self.training else 0.0
+        y = F.scaled_dot_product_attention(q, k, v, dropout_p=dp, is_causal=False)
+        y = y.transpose(1, 2).contiguous().view(b, t, c)
+        return self.out(y)
+
+
+class TransformerBlockV4(nn.Module):
+    """Pre-norm Transformer block with RoPE attention and DropPath."""
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 1024,
+                 dropout: float = 0.1, drop_path: float = 0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = RoPEMultiHeadAttention(d_model, nhead, dropout=dropout)
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.norm2 = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+
+class BoundaryHead(nn.Module):
+    """SOTA-style MLP head for boundary detection."""
+    def __init__(self, d_model: int, hidden_dims=None):
+        super().__init__()
+        hidden_dims = hidden_dims or [128, 64, 8]
+        dims = [d_model] + hidden_dims + [1]
+        layers = []
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            if i < len(dims) - 2:
+                layers.append(nn.SiLU())
+        self.net = nn.Sequential(*layers)
+
+    def reset_bias(self, prior: float = 0.01):
+        bias_val = -torch.log(torch.tensor((1 - prior) / prior))
+        self.net[-1].bias.data.fill_(bias_val.item())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).squeeze(-1)
+
+
+class BoundaryNetV4(nn.Module):
+    """
+    V4 Boundary Detection Model - SOTA-aligned clean architecture.
+    
+    Design principles (from SongFormer analysis):
+    1. Strong Conv frontend for local feature extraction
+    2. TimeDownsample for temporal compression (like SOTA)
+    3. RoPE-based Transformer encoder (like SOTA)
+    4. Single boundary head with MLP (like SOTA)
+    5. Higher capacity (d_model=256) vs V3's 192
+    6. No multi-branch/multi-head complexity
+    """
+    def __init__(
+        self,
+        n_mels: int = 128,
+        d_model: int = 256,
+        nhead: int = 8,
+        num_layers: int = 6,
+        dim_feedforward: int = 1024,
+        dropout: float = 0.1,
+        drop_path_rate: float = 0.1,
+        downsample_kernel: int = 3,
+        downsample_stride: int = 3,
+        num_sources: int = 0,
+    ):
+        super().__init__()
+        self.d_model = d_model
+
+        # Strong Conv frontend: extract local spectral features
+        # 3 Conv layers with BatchNorm (more expressive than V3's 2 Conv layers)
+        self.frontend = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+        )
+
+        # Project flattened conv features to d_model
+        self.input_proj = nn.Sequential(
+            nn.Linear(64 * n_mels, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(d_model, d_model),
+        )
+
+        # SOTA: TimeDownsample for temporal compression
+        self.downsample = TimeDownsample1D(
+            dim_in=d_model,
+            dim_out=d_model,
+            kernel_size=downsample_kernel,
+            stride=downsample_stride,
+            padding=0,
+            dropout=dropout,
+        )
+
+        # Source embedding (optional, for multi-source training)
+        self.source_emb = nn.Embedding(max(1, int(num_sources)), d_model) if int(num_sources) > 0 else None
+
+        # RoPE Transformer encoder with stochastic depth
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, num_layers)]
+        self.encoder = nn.Sequential(*[
+            TransformerBlockV4(d_model, nhead, dim_feedforward, dropout, drop_path=dpr[i])
+            for i in range(num_layers)
+        ])
+        self.encoder_norm = nn.LayerNorm(d_model)
+
+        # SOTA: Single boundary head with MLP (no multi-head weighted fusion)
+        self.boundary_head = BoundaryHead(d_model, hidden_dims=[128, 64, 8])
+
+        # Contrastive projection (for optional auxiliary loss)
+        self.proj_contrast = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, 128),
+        )
+
+    def forward(self, mel: torch.Tensor, source_id: torch.Tensor = None) -> torch.Tensor:
+        # mel: (B, n_mels, T) -> need (B, 1, n_mels, T) for Conv2d
+        x = mel.unsqueeze(1)  # (B, 1, n_mels, T)
+        x = self.frontend(x)  # (B, 64, n_mels, T)
+
+        # Reshape: (B, 64, n_mels, T) -> (B, T, 64*n_mels)
+        x = x.permute(0, 3, 1, 2).contiguous()
+        x = x.view(x.size(0), x.size(1), -1)
+
+        # Project to d_model
+        x = self.input_proj(x)  # (B, T, d_model)
+
+        # SOTA: TimeDownsample
+        x = self.downsample(x)  # (B, T_down, d_model)
+
+        # Source embedding
+        if source_id is not None and self.source_emb is not None:
+            b = x.size(0)
+            sid = source_id.to(device=mel.device).view(-1).clamp(min=0, max=self.source_emb.num_embeddings - 1)
+            emb = self.source_emb(sid).unsqueeze(1)  # (B, 1, d_model)
+            x = x + emb
+
+        # RoPE Transformer encoder
+        x = self.encoder(x)
+        x = self.encoder_norm(x)
+
+        # Boundary prediction
+        logits = self.boundary_head(x)  # (B, T_down)
+
+        if self.training:
+            contrast_feat = self.proj_contrast(x)
+            return {"out": logits, "contrast": contrast_feat}
+        return logits
+
+
 class SegmentClassifier(nn.Module):
     def __init__(self, n_mels: int, labels: List[str], hidden: int = 256):
         super().__init__()

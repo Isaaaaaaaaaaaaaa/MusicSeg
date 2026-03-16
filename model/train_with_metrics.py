@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 
 from .config import AudioConfig, BoundaryConfig, TransformerConfig
 from .data import BoundaryDataset, ClassifierDataset, list_pairs, list_pairs_by_split, load_segments, infer_functional_segments, boundary_labels
-from .model import BoundaryNet, MultiScaleTransformerBoundaryNet, MultiScaleTransformerBoundaryNetV2, MultiScaleTransformerBoundaryNetV3, TransformerBoundaryNet, MultiResolutionBoundaryNet, SegmentClassifier, save_boundary, save_classifier, TVLoss1D
+from .model import BoundaryNet, MultiScaleTransformerBoundaryNet, MultiScaleTransformerBoundaryNetV2, MultiScaleTransformerBoundaryNetV3, BoundaryNetV4, TransformerBoundaryNet, MultiResolutionBoundaryNet, SegmentClassifier, save_boundary, save_classifier, TVLoss1D
 from .metrics import boundary_retrieval_fmeasure, pairwise_f_score, normalized_conditional_entropy
 from .infer import analyze, refine_peaks
 from scipy.ndimage import gaussian_filter1d
@@ -448,6 +448,10 @@ def estimate_pos_rate_from_dataset(dataset: torch.utils.data.Dataset, samples: i
 def set_output_bias(model: nn.Module, prior: float) -> None:
     p = float(min(1.0 - 1e-4, max(1e-4, prior)))
     logit = float(np.log(p / (1.0 - p)))
+    # V4: BoundaryHead has reset_bias method
+    if hasattr(model, "boundary_head") and hasattr(model.boundary_head, "reset_bias"):
+        model.boundary_head.reset_bias(prior=p)
+        return
     if hasattr(model, "fc") and isinstance(model.fc, nn.Linear) and model.fc.bias is not None:
         with torch.no_grad():
             model.fc.bias.fill_(logit)
@@ -608,6 +612,29 @@ def train_boundary_with_metrics(
             "downsample_dropout": 0.1,
             "drop_path_rate": 0.1,
         }
+    elif arch == "v4":
+        model = BoundaryNetV4(
+            n_mels=audio_cfg.n_mels,
+            d_model=256,
+            nhead=8,
+            num_layers=6,
+            dim_feedforward=1024,
+            dropout=0.1,
+            drop_path_rate=0.1,
+            downsample_kernel=int(getattr(boundary_cfg, "postprocess_downsample_factor", 3)),
+            downsample_stride=int(getattr(boundary_cfg, "postprocess_downsample_factor", 3)),
+        )
+        arch_cfg = {
+            "type": "v4",
+            "d_model": 256,
+            "nhead": 8,
+            "num_layers": 6,
+            "dim_feedforward": 1024,
+            "dropout": 0.1,
+            "drop_path_rate": 0.1,
+            "downsample_kernel": int(getattr(boundary_cfg, "postprocess_downsample_factor", 3)),
+            "downsample_stride": int(getattr(boundary_cfg, "postprocess_downsample_factor", 3)),
+        }
     elif arch == "multi_res":
         tcfg = TransformerConfig(num_layers=4, nhead=4, dim_feedforward=512, dropout=0.1)
         model = MultiResolutionBoundaryNet(
@@ -735,6 +762,10 @@ def train_boundary_with_metrics(
                 logits = outputs
                 contrast_feat = None
             
+            # Downsample labels to match model output length (for v4, songformer_ds with TimeDownsample)
+            if logits.shape[-1] != labels.shape[-1]:
+                labels = F.interpolate(labels.unsqueeze(1).float(), size=logits.shape[-1], mode='linear', align_corners=False).squeeze(1)
+            
             # Loss calculation
             loss_mode = str(boundary_loss).lower()
             
@@ -786,7 +817,12 @@ def train_boundary_with_metrics(
                 aux_decay = max(0.1, 1.0 - float(epoch) / float(epochs))
                 aux_weight = 0.4 * aux_decay 
                 for aux in logits_aux:
-                    loss = loss + aux_weight * compute_loss(aux, labels)
+                    # Match label size to aux head output
+                    if aux.shape[-1] != labels.shape[-1]:
+                        aux_labels = F.interpolate(labels.unsqueeze(1).float(), size=aux.shape[-1], mode='linear', align_corners=False).squeeze(1)
+                    else:
+                        aux_labels = labels
+                    loss = loss + aux_weight * compute_loss(aux, aux_labels)
             
             # Structure Contrastive Loss (SOTA)
             if contrast_feat is not None and float(contrastive_weight) > 0.0:

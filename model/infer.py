@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from .config import AudioConfig, BoundaryConfig, TransformerConfig
-from .model import BoundaryNet, MultiScaleTransformerBoundaryNet, MultiScaleTransformerBoundaryNetV2, MultiScaleTransformerBoundaryNetV3, MultiResolutionBoundaryNet, SegmentClassifier, SegmentMelCNN, SegmentMelAttn, SegmentMelAttnGate, TransformerBoundaryNet
+from .model import BoundaryNet, MultiScaleTransformerBoundaryNet, MultiScaleTransformerBoundaryNetV2, MultiScaleTransformerBoundaryNetV3, BoundaryNetV4, MultiResolutionBoundaryNet, SegmentClassifier, SegmentMelCNN, SegmentMelAttn, SegmentMelAttnGate, TransformerBoundaryNet
 
 
 def load_boundary(path: str) -> Dict:
@@ -52,6 +52,18 @@ def load_boundary(path: str) -> Dict:
             downsample_stride=int(arch.get("downsample_stride", 3)),
             downsample_dropout=float(arch.get("downsample_dropout", 0.1)),
             drop_path_rate=float(arch.get("drop_path_rate", 0.0)), # Add drop_path_rate
+        )
+    elif arch.get("type") == "v4":
+        model = BoundaryNetV4(
+            n_mels=cfg["audio_cfg"]["n_mels"],
+            d_model=int(arch.get("d_model", 256)),
+            nhead=int(arch.get("nhead", 8)),
+            num_layers=int(arch.get("num_layers", 6)),
+            dim_feedforward=int(arch.get("dim_feedforward", 1024)),
+            dropout=float(arch.get("dropout", 0.1)),
+            drop_path_rate=float(arch.get("drop_path_rate", 0.1)),
+            downsample_kernel=int(arch.get("downsample_kernel", 3)),
+            downsample_stride=int(arch.get("downsample_stride", 3)),
         )
     elif arch.get("type") == "multi_res":
         tcfg = TransformerConfig(**arch.get("tcfg", {}))
@@ -263,7 +275,13 @@ def sliding_boundary_probs(model, mel: np.ndarray, cfg: BoundaryConfig, use_glob
             x = torch.from_numpy(mel).unsqueeze(0).float().to(device)
             logits = model(x)
             p = torch.sigmoid(logits).squeeze(0).detach().cpu().numpy()
-        probs[: n_frames] = p
+        # Handle downsampled output
+        if len(p) < n_frames:
+            from scipy.interpolate import interp1d
+            old_x = np.linspace(0, 1, len(p))
+            new_x = np.linspace(0, 1, n_frames)
+            p = interp1d(old_x, p, kind='linear', fill_value='extrapolate')(new_x).astype(np.float32)
+        probs[: n_frames] = p[:n_frames]
         counts[: n_frames] = 1
         return probs
 
@@ -281,7 +299,13 @@ def sliding_boundary_probs(model, mel: np.ndarray, cfg: BoundaryConfig, use_glob
                 x = torch.from_numpy(chunk).unsqueeze(0).float().to(device)
                 logits = model(x)
                 p = torch.sigmoid(logits).squeeze(0).detach().cpu().numpy()
-            probs[start : start + window] += p
+            # Handle downsampled output (V4, songformer_ds): upsample back
+            if len(p) < window:
+                from scipy.interpolate import interp1d
+                old_x = np.linspace(0, 1, len(p))
+                new_x = np.linspace(0, 1, window)
+                p = interp1d(old_x, p, kind='linear', fill_value='extrapolate')(new_x).astype(np.float32)
+            probs[start : start + window] += p[:window]
             counts[start : start + window] += 1
             start += hop
     counts[counts == 0] = 1

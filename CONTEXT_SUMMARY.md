@@ -53,7 +53,78 @@
 6. **Structure Contrastive Loss**: 结构对比损失 (weight=0.1)
 7. **SOTA Classifier Arch**: TimeDownsample1D + SEBlock + Transformer Encoder + **SoftmaxFocalLoss**
 
-## 推荐训练命令（v26_final_optimized - 终极调优）
+## V4 架构升级 (v27)
+
+### 核心改进 (SOTA 对标分析)
+1. **RoPE Attention**: 替换 Sinusoidal PE，如同 SongFormer 使用 Rotary Position Embedding
+2. **单分支架构**: 移除 V3 的 3 分支 + 5 头加权融合，改为单分支 + 单头 (SOTA 风格)
+3. **更强 Conv Frontend**: 3 层 Conv2D + BatchNorm + GELU (代替 V3 的 2 层 ReLU)
+4. **更高容量**: d_model=256, feedforward=1024, 6 层 Transformer, 8 heads
+5. **SOTA Input Projection**: Linear → LayerNorm → GELU → Dropout → Linear (同 SongFormer)
+6. **SiLU Boundary Head**: MLP [128, 64, 8, 1] 使用 SiLU 激活 (同 SOTA Head)
+7. **标签下采样**: 训练时自动将标签插值到模型输出尺寸
+8. **推理上采样**: 滑动窗口推理时自动将下采样输出插值回原始分辨率
+
+### V3 vs V4 对比
+| 方面 | V3 (songformer_ds) | V4 |
+|------|-------------------|----|
+| d_model | 192 | **256** |
+| Transformer 层数 | 4+2+2 (3分支) | **6** (单分支) |
+| feedforward | 384 | **1024** |
+| heads | 4 | **8** |
+| Attention | MultiheadAttention | **RoPE MHA** |
+| 预测头 | 5 头加权融合 | **单头 MLP** |
+| 参数量 | ~3M | ~8M |
+| 设计理念 | 多分支多尺度 | **SOTA 简洁设计** |
+
+## 推荐训练命令（v27 - V4架构）
+
+### V4 边界检测 (推荐)
+```bash
+python3 -m model.train_pipeline \
+  --data_dir /root/MusicSeg/data/songform-hx-aligned \
+  --ckpt_dir /root/MusicSeg/checkpoints/hx_boundary_v27 \
+  --arch v4 \
+  --epochs 300 \
+  --boundary_epochs 300 \
+  --classifier_epochs 0 \
+  --boundary_batch_size 4 \
+  --boundary_lr 1e-4 \
+  --boundary_eval_mode paper \
+  --boundary_eval_interval 1 \
+  --boundary_eval_thresholds "0.0,0.003,0.005,0.008,0.01,0.015,0.02,0.03" \
+  --boundary_loss bce \
+  --boundary_contrastive_weight 0.05 \
+  --boundary_peak_refine_radius 24 \
+  --boundary_songformer_postprocess \
+  --boundary_local_maxima_filter_size 3 \
+  --boundary_postprocess_window_past_sec 6 \
+  --boundary_postprocess_window_future_sec 6 \
+  --boundary_postprocess_downsample_factor 3 \
+  --boundary_pos_weight_max 100 \
+  --boundary_tv_weight 0.05 \
+  --boundary_rate_weight 0.0 \
+  --boundary_weight_decay 3e-7 \
+  --boundary_beta1 0.8 \
+  --boundary_beta2 0.999 \
+  --boundary_grad_clip 1.0 \
+  --boundary_early_stopping_patience 50 \
+  --boundary_accum_steps 4 \
+  --boundary_warmup_steps 500 \
+  --boundary_ema_decay 0.999 \
+  --boundary_ema_update_after_steps 200
+```
+
+### V4 核心调优点
+1. **纯 BCE Loss**: SOTA SongFormer 也使用 BCE 作为主损失，简单稳定
+2. **更低学习率 1e-4**: 更大模型需要更小的学习率
+3. **更低 weight_decay 3e-7**: 对标 SOTA 配置
+4. **beta1=0.8**: 对标 SOTA 配置
+5. **TV weight 0.05**: 对标 SOTA 的 boundary_tvloss_weight
+6. **降低 contrastive weight**: 0.05 代替 0.1，避免干扰主损失
+7. **batch_size=4**: 更大模型需要更小 batch + 更多梯度累积
+
+## 旧版训练命令（v26_final_optimized - songformer_ds）
 **核心优化点 (基于历次复盘)**:
 1. **数据采样 (Data Sampling)**: 修正了过拟合的根源——95% 边界居中采样。调整为 **60% 边界 + 40% 随机背景**，大幅增加负样本多样性，降低误报率。
 2. **数据增强 (SpecAugment)**: 增强了时间掩码 (Time Mask) 宽度 (35->100)，迫使模型利用更长上下文。
